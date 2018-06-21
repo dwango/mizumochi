@@ -20,6 +20,7 @@ extern crate slog_term;
 
 mod config;
 mod http;
+mod localfile;
 mod metrics;
 mod mizumochi;
 
@@ -28,7 +29,6 @@ use clap::Arg;
 use config::{Config, Speed};
 use mizumochi::Mizumochi;
 use slog::{Drain, Level};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,26 +67,22 @@ fn main() -> Result<(), Box<std::error::Error>> {
                 .default_value("33133"),
         )
         .arg(
-            Arg::with_name("SRC_FILE")
-                .help("Sets the source file to use")
+            Arg::with_name("ORIGINAL_DIR")
+                .help("Sets a directory has original files")
                 .required(true)
                 .index(1),
         )
         .arg(
-            Arg::with_name("DST_FILE")
-                .help("Sets the destination file to use")
+            Arg::with_name("MOUNTPOINT")
+                .help("Mountpoint directory")
                 .required(true)
                 .index(2),
         )
         .get_matches();
 
-    let src = matches.value_of("SRC_FILE").unwrap();
-    let dst = matches.value_of("DST_FILE").unwrap();
+    let original_dir = matches.value_of("ORIGINAL_DIR").unwrap();
+    let mountpoint = matches.value_of("MOUNTPOINT").unwrap();
     let http_port: u16 = matches.value_of("HTTP_PORT").unwrap().parse()?;
-
-    let src = Path::new(src).canonicalize()?;
-    let dst = Path::new(dst);
-    let mountpoint = dst.parent().ok_or("cannot get mountpoint")?;
 
     let mut config: Config = Default::default();
 
@@ -111,8 +107,8 @@ fn main() -> Result<(), Box<std::error::Error>> {
     let drain = slog::Fuse::new(slog::LevelFilter::new(drain, Level::Info));
     let logger = slog::Logger::root(drain, o!());
 
-    info!(logger, "src: {}", src.to_str().expect("src is invalid"));
-    info!(logger, "dst: {}", dst.to_str().expect("dst is invalid"));
+    info!(logger, "original directory: {}", original_dir);
+    info!(logger, "mountpoint: {}", mountpoint);
     info!(logger, "config: {}", config);
 
     let config = Arc::new(AtomicImmut::new(config));
@@ -120,9 +116,8 @@ fn main() -> Result<(), Box<std::error::Error>> {
 
     let m = Mizumochi::new(
         logger.clone(),
+        original_dir.into(),
         mountpoint.into(),
-        src.into(),
-        dst.into(),
         config,
     );
 

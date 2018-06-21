@@ -3,10 +3,12 @@ use atomic_immut::AtomicImmut;
 use config::{Config, Speed};
 use fuse::{self, *};
 use libc;
+use localfile::{Inode, LocalFile};
 use metrics::Metrics;
 use slog::Logger;
 use std;
 use std::collections::HashMap;
+use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -21,7 +23,6 @@ use std::time::Instant;
 use time::{PreciseTime, Timespec};
 
 type FileHandler = u64;
-type Inode = u64;
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
 const ROOT_DIR_INO: u64 = 1;
@@ -35,16 +36,14 @@ pub struct Mizumochi {
     current_mode_begin_time: Instant,
 
     // FIXME: use simple allocator.
-    fh_count: FileHandler,
     ino_count: Inode,
-    fh_map: HashMap<FileHandler, (Inode, File)>,
-    ino_map: HashMap<Inode, PathBuf>,
-    name_map: HashMap<(Inode, PathBuf), Inode>,
+    fh_count: FileHandler,
 
+    fh_map: HashMap<FileHandler, File>,
+    file_map: HashMap<Inode, LocalFile>,
+
+    original_dir: PathBuf,
     mountpoint: PathBuf,
-    src_file_path: PathBuf,
-    dst_file_path: PathBuf,
-    src_dir_path: String,
 
     metrics: Metrics,
 }
@@ -52,9 +51,8 @@ pub struct Mizumochi {
 impl Mizumochi {
     pub fn new(
         logger: Logger,
+        original_dir: PathBuf,
         mountpoint: PathBuf,
-        src: PathBuf,
-        dst: PathBuf,
         config: Arc<AtomicImmut<Config>>,
     ) -> Mizumochi {
         Mizumochi {
@@ -66,15 +64,13 @@ impl Mizumochi {
             current_mode_begin_time: Instant::now(),
 
             fh_count: 1,
-            ino_count: 2,
+            // inode number begins from the next of `ROOT_DIR_INO`.
+            ino_count: ROOT_DIR_INO + 1,
             fh_map: HashMap::new(),
-            ino_map: HashMap::new(),
-            name_map: HashMap::new(),
+            file_map: HashMap::new(),
 
             mountpoint,
-            src_file_path: src,
-            dst_file_path: dst,
-            src_dir_path: String::new(),
+            original_dir,
 
             metrics: Metrics::new(),
         }
@@ -83,6 +79,82 @@ impl Mizumochi {
     pub fn mount(self) -> Result<(), io::Error> {
         let mountpoint = self.mountpoint.clone();
         fuse::mount(self, &mountpoint, &[])
+    }
+
+    fn init(&mut self) -> Result<(), io::Error> {
+        if !self.original_dir.is_dir() {
+            error!(
+                self.logger,
+                "Original filepath is not directory: {:?}", self.original_dir
+            );
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Not directory"));
+        }
+
+        // Initialize timers for switching stable/unstable.
+        let now = Instant::now();
+        self.current_mode_begin_time = now;
+        info!(self.logger, "is_unstable: {}", self.is_unstable);
+
+        let path = self.original_dir.clone();
+        self.fetch_files_if_not_found(ROOT_DIR_INO, &path)?;
+
+        Ok(())
+    }
+
+    fn fetch_files_if_not_found(
+        &mut self,
+        root_ino: Inode,
+        root_dir: &PathBuf,
+    ) -> Result<(), io::Error> {
+        if !root_dir.is_dir() {
+            error!(
+                self.logger,
+                "fetch_files_if_not_found error: path: {:?} is directory, ino: {}",
+                root_dir,
+                root_ino
+            );
+            return Err(io::Error::new(io::ErrorKind::Other, "Not directory"));
+        }
+
+        if let Some(LocalFile::Directory(_, Some(_))) = self.file_map.get(&root_ino) {
+            // Already fetched.
+            return Ok(());
+        }
+
+        info!(
+            self.logger,
+            "fetch_files_if_not_found: ino: {}, path: {:?}", root_ino, root_dir
+        );
+
+        let mut files = Vec::new();
+
+        // Fetch the all files in the directory.
+        for entry in fs::read_dir(root_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            let filename = path
+                .file_name()
+                .ok_or(io::Error::new(io::ErrorKind::Other, "Cannot get filename"))?;
+
+            let file = if path.is_dir() {
+                // The files in the directory is loaded later (see lookup).
+                LocalFile::Directory(path.clone().into(), None)
+            } else {
+                LocalFile::RegularFile(path.clone().into())
+            };
+
+            let ino = self.ino_count;
+            self.ino_count += 1;
+            self.file_map.insert(ino, file);
+
+            files.push((ino, filename.into()));
+        }
+
+        self.file_map
+            .insert(root_ino, LocalFile::Directory(root_dir.into(), Some(files)));
+
+        Ok(())
     }
 
     fn toggle_mode_if_necessary(&mut self) -> bool {
@@ -111,17 +183,42 @@ impl Mizumochi {
         self.is_unstable
     }
 
-    fn lookup(&self, parent: u64, name: &OsStr) -> Result<FileAttr, c_int> {
-        let key = (parent, name.into());
-        let ino = self.name_map.get(&key).ok_or(libc::ENOENT)?;
-        let path = self.ino_map.get(&ino).ok_or(libc::ENOENT)?;
+    fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, io::Error> {
+        let (inode, path) = match self
+            .file_map
+            .get(&parent)
+            .ok_or(io::Error::new(io::ErrorKind::NotFound, ""))?
+        {
+            LocalFile::Directory(_, None) => {
+                Err(io::Error::new(io::ErrorKind::Other, "not fetched"))
+            }
+            LocalFile::Directory(path, Some(files)) => {
+                // Find the file by the given name.
+                let f = files.iter().find(|(_, path)| { Some(name) == path.file_name() });
 
-        fetch_fileattr(*ino, path).or(Err(libc::EIO))
+                let (inode, _) = f.ok_or(io::Error::new(io::ErrorKind::NotFound, ""))?;
+
+                let mut path = path.clone();
+                path.push(name);
+
+                Ok((*inode, path))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "it is not directory",
+            )),
+        }?;
+
+        if path.is_dir() {
+            self.fetch_files_if_not_found(inode, &path)?;
+        }
+
+        fetch_fileattr(inode, &path)
     }
 
     fn read(&mut self, fh: u64, buffer: &mut [u8], offset: i64, size: u32) -> Result<usize, c_int> {
         let logger = &self.logger;
-        let (_, f) = self.fh_map.get_mut(&fh).ok_or(libc::ENOENT)?;
+        let f = self.fh_map.get_mut(&fh).ok_or(libc::ENOENT)?;
 
         let file_size = f.metadata().map_err(|_| libc::EIO)?.len();
 
@@ -150,7 +247,7 @@ impl Mizumochi {
 
     fn write(&mut self, fh: u64, buffer: &[u8], offset: i64) -> Result<usize, c_int> {
         let logger = &self.logger;
-        let (_, f) = self.fh_map.get_mut(&fh).ok_or(libc::ENOENT)?;
+        let f = self.fh_map.get_mut(&fh).ok_or(libc::ENOENT)?;
         if let Err(error) = f.seek(SeekFrom::Start(offset as u64)) {
             error!(self.logger, "seek error {}", error);
             return Err(libc::EIO);
@@ -173,36 +270,106 @@ impl Mizumochi {
 
         Ok(written_size)
     }
+
+    fn readdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _: u64,
+        offset: i64,
+        reply: &mut ReplyDirectory,
+    ) -> Result<(), io::Error> {
+        if offset != 0 {
+            // From the FUSE document https://libfuse.github.io/doxygen/structfuse__operations.html#ae269583c4bfaf4d9a82e1d51a902cd5c
+            // Filesystem can ignore the offset.
+            // > 1) The readdir implementation ignores the offset parameter, and passes zero to the filler function's offset.
+            // > The filler function will not return '1' (unless an error happens), so the whole directory is read in a single readdir operation.
+            return Ok(());
+        }
+
+        let files = match self.file_map.get(&ino) {
+            Some(LocalFile::Directory(_, Some(files))) => Ok(files),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "")),
+        }?;
+
+        // Add itself and the parent.
+        reply.add(1, 0, FileType::Directory, ".");
+        reply.add(1, 1, FileType::Directory, "..");
+
+        // Add the files in the directory.
+        let mut offset = 2i64;
+        for (fino, _) in files {
+            let (ftype, path) = match self.file_map.get(&fino) {
+                Some(LocalFile::RegularFile(path)) => (FileType::RegularFile, path),
+                Some(LocalFile::Directory(path, _)) => (FileType::Directory, path),
+                None => {
+                    crit!(self.logger, "file_map is inconsistent: {:?}", self.file_map);
+                    crit!(self.logger, "directory ino: {}, file ino: {}", ino, fino);
+                    return Err(io::Error::new(io::ErrorKind::Other, "meybe bug"));
+                }
+            };
+
+            let filename = path
+                .file_name()
+                .ok_or(io::Error::new(io::ErrorKind::Other, "Cannot get filename"))?;
+            reply.add(*fino, offset, ftype, filename);
+
+            offset += 1;
+        }
+
+        Ok(())
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _flags: u32,
+    ) -> Result<(FileAttr, FileHandler), io::Error> {
+        let name = name
+            .to_str()
+            .ok_or(io::Error::new(io::ErrorKind::Other, ""))?;
+
+        let (attr, fh, ino, f) = {
+            let (mut path, files) = match self.file_map.get_mut(&parent) {
+                Some(LocalFile::Directory(path, Some(files))) => Ok((path.clone(), files)),
+                _ => Err(io::Error::new(io::ErrorKind::Other, "")),
+            }?;
+
+            path.push(name);
+
+            let file = File::create(&path)?;
+
+            let ino = self.ino_count;
+            self.ino_count += 1;
+
+            let attr = fetch_fileattr(ino, &path)?;
+
+            let fh = self.fh_count;
+            self.fh_count += 1;
+
+            self.fh_map.insert(fh, file);
+            files.push((ino, name.into()));
+
+            (attr, fh, ino, LocalFile::RegularFile(path.clone()))
+        };
+
+        self.file_map.insert(ino, f);
+
+        Ok((attr, fh))
+    }
 }
 
 impl Filesystem for Mizumochi {
     fn init(&mut self, _req: &Request) -> Result<(), c_int> {
-        info!(self.logger, "Initialize");
+        info!(self.logger, "init");
 
-        // Initialize timers for switching stable/unstable.
-        let now = Instant::now();
-        self.current_mode_begin_time = now;
-        info!(self.logger, "is_unstable: {}", self.is_unstable);
-
-        // Store the filepaths.
-        let ino = self.ino_count;
-        self.ino_count += 1;
-        self.ino_map.insert(ino, self.src_file_path.clone());
-
-        self.src_dir_path = self
-            .src_file_path
-            .parent()
-            .ok_or(libc::EIO)?
-            .to_str()
-            .ok_or(libc::EIO)?
-            .to_string();
-        self.ino_map
-            .insert(ROOT_DIR_INO, self.src_dir_path.clone().into());
-
-        let filename = self.dst_file_path.file_name().ok_or(libc::EIO)?;
-        self.name_map.insert((ROOT_DIR_INO, filename.into()), ino);
-
-        Ok(())
+        Mizumochi::init(self).map_err(|error| {
+            error!(self.logger, "init error: {}", error.description());
+            libc::EIO
+        })
     }
 
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -211,13 +378,13 @@ impl Filesystem for Mizumochi {
 
         match Mizumochi::lookup(self, parent, name) {
             Ok(ref attr) => reply.entry(&TTL, attr, 0),
-            Err(ecode) => {
-                error!(
-                    self.logger,
-                    "lookup error: parent: {}, name: {:?}", parent, name
-                );
-                reply.error(ecode)
-            }
+            Err(error) => match error.kind() {
+                io::ErrorKind::NotFound => reply.error(libc::ENOENT),
+                _ => {
+                    error!(self.logger, "lookup error: {}", error.description());
+                    reply.error(libc::EIO)
+                }
+            },
         }
     }
 
@@ -225,22 +392,36 @@ impl Filesystem for Mizumochi {
         debug!(self.logger, "getattr: ino: {:?}", ino);
         self.metrics.io_operations_getattr.increment();
 
-        if let Some(path) = self.ino_map.get(&ino) {
-            match fetch_fileattr(ino, path) {
+        match self.file_map.get(&ino) {
+            Some(LocalFile::RegularFile(path)) => match fetch_fileattr(ino, path) {
                 Ok(attr) => reply.attr(&TTL, &attr),
                 Err(error) => {
-                    error!(self.logger, "getattr error: {}", error);
+                    error!(
+                        self.logger,
+                        "getattr error: ino = {}, path = {:?}, error = {}", ino, path, error
+                    );
                     reply.error(libc::EIO)
                 }
+            },
+            Some(LocalFile::Directory(path, _)) => match fetch_fileattr(ino, path) {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(error) => {
+                    error!(
+                        self.logger,
+                        "getattr error: ino = {}, path = {:?}, error = {}", ino, path, error
+                    );
+                    reply.error(libc::EIO)
+                }
+            },
+            _ => {
+                reply.error(libc::ENOENT);
             }
-        } else {
-            reply.error(libc::ENOENT);
         }
     }
 
     fn readdir(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -252,23 +433,19 @@ impl Filesystem for Mizumochi {
         );
         self.metrics.io_operations_readdir.increment();
 
-        if ino == ROOT_DIR_INO {
-            // Support one root currently.
-            if offset == 0 {
-                // reply.add(ino, offset, kind: FileType, name);
-                reply.add(1, 0, FileType::Directory, ".");
-                reply.add(1, 1, FileType::Directory, "..");
-                for ((_, path), ino) in self
-                    .name_map
-                    .iter()
-                    .filter(|((ino, _), _)| *ino == ROOT_DIR_INO)
-                {
-                    reply.add(*ino, *ino as i64, FileType::RegularFile, path);
+        use self::io::ErrorKind;
+        if let Err(error) = self.readdir(req, ino, fh, offset, &mut reply) {
+            let e = match error.kind() {
+                ErrorKind::NotFound => libc::ENOENT,
+                _ => {
+                    error!(self.logger, "readdir error: {}", error.description());
+                    libc::EIO
                 }
-            }
-            reply.ok();
+            };
+
+            reply.error(e);
         } else {
-            reply.error(libc::ENOENT);
+            reply.ok();
         }
     }
 
@@ -333,13 +510,30 @@ impl Filesystem for Mizumochi {
         debug!(self.logger, "setattr: ino: {}, fh: {:?}", ino, fh);
         self.metrics.io_operations_setattr.increment();
 
-        // TODO: apply the argument to the dst file attribute (self.dst_attr).
-        match self.ino_map.get(&ino) {
-            Some(path) => match fetch_fileattr(ino, path) {
-                Ok(ref attr) => reply.attr(&TTL, attr),
-                Err(_) => reply.error(libc::EIO),
+        match self.file_map.get(&ino) {
+            Some(LocalFile::RegularFile(path)) => match fetch_fileattr(ino, path) {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(error) => {
+                    error!(
+                        self.logger,
+                        "getattr error: ino = {}, path = {:?}, error = {}", ino, path, error
+                    );
+                    reply.error(libc::EIO)
+                }
             },
-            None => reply.error(libc::ENOENT),
+            Some(LocalFile::Directory(path, _)) => match fetch_fileattr(ino, path) {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(error) => {
+                    error!(
+                        self.logger,
+                        "getattr error: ino = {}, path = {:?}, error = {}", ino, path, error
+                    );
+                    reply.error(libc::EIO)
+                }
+            },
+            _ => {
+                reply.error(libc::ENOENT);
+            }
         }
     }
 
@@ -391,26 +585,34 @@ impl Filesystem for Mizumochi {
         info!(self.logger, "open ino: {}, flags: {}", ino, flags);
         self.metrics.io_operations_open.increment();
 
-        if let Some(path) = self.ino_map.get(&ino) {
-            info!(self.logger, " -> {:?}", path);
-            let mut options = fs::OpenOptions::new();
-            options.read(true).write(true).create(false);
+        match self.file_map.get(&ino) {
+            Some(LocalFile::RegularFile(filepath)) => {
+                let mut options = fs::OpenOptions::new();
+                options.read(true).write(true).create(false);
 
-            match options.open(path) {
-                Ok(f) => {
-                    let fh = self.fh_count;
-                    self.fh_count += 1;
-                    self.fh_map.insert(fh, (ino, f));
+                info!(self.logger, "filepath: {:?}", filepath);
+                match options.open(filepath) {
+                    Ok(f) => {
+                        let fh = self.fh_count;
+                        self.fh_count += 1;
+                        self.fh_map.insert(fh, f);
 
-                    reply.opened(fh, 0);
-                }
-                Err(error) => {
-                    error!(self.logger, "open error: {}", error);
-                    reply.error(libc::EIO)
+                        reply.opened(fh, 0);
+                    }
+                    Err(error) => {
+                        error!(self.logger, "open error: {}", error);
+                        reply.error(libc::EIO)
+                    }
                 }
             }
-        } else {
-            reply.error(libc::ENOENT)
+            Some(LocalFile::Directory(filepath, _)) => {
+                error!(self.logger, "directory: {:?}", filepath);
+                reply.error(libc::ENOENT)
+            }
+            None => {
+                error!(self.logger, "readdir error: inode {} is not found", ino);
+                reply.error(libc::ENOENT)
+            }
         }
     }
 
@@ -418,7 +620,7 @@ impl Filesystem for Mizumochi {
         debug!(self.logger, "flush: ino: {}, fh: {}", ino, fh);
         self.metrics.io_operations_flush.increment();
 
-        if let Some((_, f)) = self.fh_map.get_mut(&fh) {
+        if let Some(f) = self.fh_map.get_mut(&fh) {
             if let Err(error) = f.seek(SeekFrom::Start(0)) {
                 info!(self.logger, "flush seek error: {}", error);
                 reply.error(libc::EIO);
@@ -444,7 +646,7 @@ impl Filesystem for Mizumochi {
         info!(self.logger, "release: ino: {}, fh: {}", ino, fh);
         self.metrics.io_operations_release.increment();
 
-        if let Some((_, f)) = self.fh_map.remove(&fh) {
+        if let Some(f) = self.fh_map.remove(&fh) {
             if let Err(error) = f.sync_data() {
                 error!(self.logger, "sync_data error: {}", error);
                 reply.error(libc::EIO);
@@ -464,7 +666,7 @@ impl Filesystem for Mizumochi {
         );
         self.metrics.io_operations_fsync.increment();
 
-        if let Some((_, f)) = self.fh_map.get(&fh) {
+        if let Some(f) = self.fh_map.get(&fh) {
             if let Err(error) = f.sync_data() {
                 error!(self.logger, "sync_data error: {}", error);
                 reply.error(libc::EIO);
@@ -586,9 +788,10 @@ impl Filesystem for Mizumochi {
         reply.error(libc::ENOSYS);
     }
 
-    fn opendir(&mut self, _req: &Request, _ino: u64, _flags: u32, reply: ReplyOpen) {
-        debug!(self.logger, "opendir");
+    fn opendir(&mut self, _req: &Request, ino: u64, _flags: u32, reply: ReplyOpen) {
+        debug!(self.logger, "opendir: ino: {}", ino);
         self.metrics.io_operations_opendir.increment();
+
         reply.opened(0, 0);
     }
 
@@ -652,56 +855,22 @@ impl Filesystem for Mizumochi {
 
     fn create(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _flags: u32,
+        mode: u32,
+        flags: u32,
         reply: ReplyCreate,
     ) {
-        debug!(self.logger, "create");
+        debug!(self.logger, "create: parent: {}, name: {:?}", parent, name);
         self.metrics.io_operations_create.increment();
 
-        if parent != ROOT_DIR_INO {
-            // Current support is only the root directory.
-            reply.error(libc::ENOSYS);
-            return;
-        }
-
-        let name = if let Some(name) = name.to_str() {
-            name
-        } else {
-            reply.error(libc::EIO);
-            return;
-        };
-
-        let path = self.src_dir_path.clone() + "/" + name;
-        let path = Path::new(&path);
-
-        match File::create(path) {
-            Ok(file) => {
-                let ino = self.ino_count;
-                self.ino_count += 1;
-
-                match fetch_fileattr(ino, path) {
-                    Ok(attr) => {
-                        let fh = self.fh_count;
-                        self.fh_count += 1;
-
-                        reply.created(&TTL, &attr, 0, fh, 0);
-
-                        let path = path.to_path_buf();
-                        self.fh_map.insert(fh, (ino, file));
-                        self.ino_map.insert(ino, path.clone());
-                        self.name_map.insert((ROOT_DIR_INO, name.into()), ino);
-                    }
-                    Err(_) => {
-                        self.ino_count -= 1;
-                        reply.error(libc::EIO);
-                    }
-                }
+        match Mizumochi::create(self, req, parent, name, mode, flags) {
+            Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, 0),
+            Err(error) => {
+                error!(self.logger, "init error: {}", error.description());
+                reply.error(libc::EIO)
             }
-            Err(_) => reply.error(libc::EIO),
         }
     }
 
