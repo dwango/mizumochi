@@ -26,7 +26,7 @@ mod mizumochi;
 
 use atomic_immut::AtomicImmut;
 use clap::Arg;
-use config::{Config, Speed};
+use config::Config;
 use mizumochi::Mizumochi;
 use slog::{Drain, Level};
 use std::sync::Arc;
@@ -35,11 +35,12 @@ use std::time::Duration;
 fn main() -> Result<(), Box<std::error::Error>> {
     let matches = app_from_crate!()
         .arg(
-            Arg::with_name("SPEED_BPS")
+            Arg::with_name("SPEED")
                 .short("s")
-                .long("speed_bps")
+                .long("speed")
                 .value_name("BytePerSecond")
                 .help("Sets byte per second to limit file operations")
+                .long_help("you can put suffixes (KBps, MBps, GBps) at the tail (examples: 1024Bps, 4096KBps, 5Mbps)\nthe default is Bps")
                 .takes_value(true),
         )
         .arg(
@@ -87,8 +88,8 @@ fn main() -> Result<(), Box<std::error::Error>> {
     let mut config: Config = Default::default();
 
     // Override the config if there are given options.
-    if let Some(speed_bps) = matches.value_of("SPEED_BPS") {
-        config.speed = Speed::Bps(speed_bps.parse()?);
+    if let Some(speed) = matches.value_of("SPEED") {
+        config.speed = speed.parse()?;
     }
 
     if let Some(duration) = matches.value_of("DURATION") {
