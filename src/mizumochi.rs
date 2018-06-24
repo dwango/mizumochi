@@ -1,11 +1,12 @@
 // FIXME: Refactor error
 use atomic_immut::AtomicImmut;
-use config::{Config, Speed};
+use config::{Config, Operation, Speed};
 use fuse::{self, *};
 use libc;
 use localfile::{Inode, LocalFile};
 use metrics::Metrics;
 use slog::Logger;
+use state::{State, StateManager};
 use std;
 use std::collections::HashMap;
 use std::error::Error;
@@ -19,7 +20,6 @@ use std::result::Result;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
-use std::time::Instant;
 use time::{PreciseTime, Timespec};
 
 type FileHandler = u64;
@@ -30,10 +30,8 @@ const ROOT_DIR_INO: u64 = 1;
 pub struct Mizumochi {
     logger: Logger,
 
+    state_manager: StateManager,
     config: Arc<AtomicImmut<Config>>,
-
-    is_unstable: bool,
-    current_mode_begin_time: Instant,
 
     // FIXME: use simple allocator.
     ino_count: Inode,
@@ -55,13 +53,14 @@ impl Mizumochi {
         mountpoint: PathBuf,
         config: Arc<AtomicImmut<Config>>,
     ) -> Mizumochi {
+        let cond = (&*config.load()).condition.clone();
+        let state_manager = StateManager::new(cond);
+
         Mizumochi {
             logger,
 
+            state_manager,
             config,
-
-            is_unstable: false,
-            current_mode_begin_time: Instant::now(),
 
             fh_count: 1,
             // inode number begins from the next of `ROOT_DIR_INO`.
@@ -90,10 +89,9 @@ impl Mizumochi {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Not directory"));
         }
 
-        // Initialize timers for switching stable/unstable.
-        let now = Instant::now();
-        self.current_mode_begin_time = now;
-        info!(self.logger, "is_unstable: {}", self.is_unstable);
+        // Initialize the state.
+        self.state_manager.init();
+        info!(self.logger, "State: {:?}", self.state_manager.state());
 
         let path = self.original_dir.clone();
         self.fetch_files_if_not_found(ROOT_DIR_INO, &path)?;
@@ -157,30 +155,35 @@ impl Mizumochi {
         Ok(())
     }
 
-    fn toggle_mode_if_necessary(&mut self) -> bool {
-        let config = self.config.load(); // Takes snapshot
-        let (next_mode, d) = toggle_mode_if_necessary(
-            self.is_unstable,
-            config.duration,
-            config.frequency,
-            self.current_mode_begin_time.elapsed().as_secs(),
-        );
-        self.current_mode_begin_time += d;
-        match (self.is_unstable, next_mode) {
-            (false, true) => {
-                self.is_unstable = true;
-                self.metrics.speed_limit_enabled.increment();
-                info!(self.logger, "--- Enable unstable mode ---")
+    fn change_state_if_necessary(&mut self, op: Operation) -> &State {
+        let prev_state = self.state_manager.state().clone();
+
+        {
+            let cond = &self.config.load().condition;
+            let state = if let Ok(state) = self.state_manager.on_operated_after(op, cond) {
+                state.clone()
+            } else {
+                crit!(
+                    self.logger,
+                    "change_state_if_necessary crit: let the state stable"
+                );
+                State::Stable
+            };
+
+            match (prev_state, state) {
+                (State::Stable, State::Unstable) => {
+                    self.metrics.speed_limit_enabled.increment();
+                    info!(self.logger, "--- Enable unstable mode ---")
+                }
+                (State::Unstable, State::Stable) => {
+                    self.metrics.speed_limit_enabled.increment();
+                    info!(self.logger, "--- Enable stable mode ---")
+                }
+                _ => {}
             }
-            (true, false) => {
-                self.is_unstable = false;
-                self.metrics.speed_limit_disabled.increment();
-                info!(self.logger, "--- Disable unstable mode ---")
-            }
-            _ => {}
         }
 
-        self.is_unstable
+        self.state_manager.state()
     }
 
     fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, io::Error> {
@@ -194,7 +197,9 @@ impl Mizumochi {
             }
             LocalFile::Directory(path, Some(files)) => {
                 // Find the file by the given name.
-                let f = files.iter().find(|(_, path)| { Some(name) == path.file_name() });
+                let f = files
+                    .iter()
+                    .find(|(_, path)| Some(name) == path.file_name());
 
                 let (inode, _) = f.ok_or(io::Error::new(io::ErrorKind::NotFound, ""))?;
 
@@ -472,7 +477,7 @@ impl Filesystem for Mizumochi {
             Ok(read_size) => {
                 reply.data(&buffer[0..read_size]);
 
-                if self.toggle_mode_if_necessary() {
+                if State::Unstable == *self.change_state_if_necessary(Operation::Read) {
                     if let Speed::Bps(bps) = self.config.load().speed {
                         // Mesure elapsed time and wait if necessary.
                         sleep(compute_sleep_duration_to_adjust_speed(
@@ -563,7 +568,7 @@ impl Filesystem for Mizumochi {
             Ok(written_size) => {
                 reply.written(written_size as u32);
 
-                if self.toggle_mode_if_necessary() {
+                if State::Unstable == *self.change_state_if_necessary(Operation::Write) {
                     if let Speed::Bps(bps) = self.config.load().speed {
                         sleep(compute_sleep_duration_to_adjust_speed(
                             bps,
@@ -976,30 +981,6 @@ fn fetch_fileattr(ino: u64, filepath: &Path) -> Result<FileAttr, io::Error> {
     Ok(attr)
 }
 
-fn toggle_mode_if_necessary(
-    is_unstable: bool,
-    duration: Duration,
-    frequency: Duration,
-    elapsed: u64,
-) -> (bool, Duration) {
-    let frequency = frequency.as_secs();
-    let duration = duration.as_secs();
-    let one_term = frequency + duration;
-
-    let cnt = elapsed / one_term;
-    let elapsed = elapsed % one_term;
-
-    let t = if !is_unstable { frequency } else { duration };
-
-    if t < elapsed {
-        // Toggle the mode if the elapsed time exceeds the current mode duration.
-        (!is_unstable, Duration::from_secs(cnt * one_term + t))
-    } else {
-        // Keep
-        (is_unstable, Duration::from_secs(cnt * one_term))
-    }
-}
-
 /// `request_bps` means request Byte per seconds (not bit).
 /// `count_byte` is the number of read/written bytes.
 /// `elapsed_ms` is the elapsed time in milliseconds to read/write data.
@@ -1057,136 +1038,5 @@ mod tests {
             Duration::from_millis(0),
             compute_sleep_duration_to_adjust_speed(1024, 512, 1000)
         );
-    }
-
-    #[test]
-    fn test_toggle_mode() {
-        let is_unstable = true;
-        let duration = Duration::from_secs(10);
-        let frequency = Duration::from_secs(60);
-
-        let mut elapsed = 0;
-
-        // Keep.
-        let (is_unstable, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, is_unstable);
-        assert_eq!(0, elapsed);
-
-        // Change it to stable.
-        elapsed += 11;
-        let (is_unstable, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(false, is_unstable);
-        assert_eq!(1, elapsed);
-
-        // Change it to unstable.
-        elapsed += 60;
-        let (is_unstable, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, is_unstable);
-        assert_eq!(1, elapsed);
-
-        // Keep unstable.
-        elapsed += 10 + 60;
-        let (is_unstable, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, is_unstable);
-        assert_eq!(1, elapsed);
-
-        // Change it to stable.
-        elapsed += 10;
-        let (is_unstable, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(false, is_unstable);
-        assert_eq!(1, elapsed);
-    }
-
-    #[test]
-    fn test_toggle_mode_stable_to_unstable() {
-        let is_unstable = false;
-        let duration = Duration::from_secs(10);
-        let frequency = Duration::from_secs(60);
-
-        let mut elapsed = 60 + 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, f);
-        assert_eq!(1, elapsed);
-
-        let mut elapsed = 60 + 10 + 60 + 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, f);
-        assert_eq!(1, elapsed);
-    }
-
-    #[test]
-    fn test_toggle_mode_unstable_to_stable() {
-        let is_unstable = true;
-        let duration = Duration::from_secs(10);
-        let frequency = Duration::from_secs(60);
-
-        let mut elapsed = 10 + 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(false, f);
-        assert_eq!(1, elapsed);
-
-        let mut elapsed = 10 + 60 + 10 + 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(false, f);
-        assert_eq!(1, elapsed);
-    }
-
-    #[test]
-    fn test_toggle_mode_keep_unstable() {
-        let is_unstable = true;
-        let duration = Duration::from_secs(10);
-        let frequency = Duration::from_secs(60);
-
-        let mut elapsed = 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, f);
-        assert_eq!(1, elapsed);
-
-        let mut elapsed = 8;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, f);
-        assert_eq!(8, elapsed);
-
-        let mut elapsed = 10 + 60 + 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(true, f);
-        assert_eq!(1, elapsed);
-    }
-
-    #[test]
-    fn test_toggle_mode_keep_stable() {
-        let is_unstable = false;
-        let duration = Duration::from_secs(10);
-        let frequency = Duration::from_secs(60);
-
-        let mut elapsed = 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(false, f);
-        assert_eq!(1, elapsed);
-
-        let mut elapsed = 8;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(false, f);
-        assert_eq!(8, elapsed);
-
-        let mut elapsed = 60 + 10 + 60 + 10 + 1;
-        let (f, d) = toggle_mode_if_necessary(is_unstable, duration, frequency, elapsed);
-        elapsed -= d.as_secs();
-        assert_eq!(false, f);
-        assert_eq!(1, elapsed);
     }
 }

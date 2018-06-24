@@ -23,10 +23,11 @@ mod http;
 mod localfile;
 mod metrics;
 mod mizumochi;
+mod state;
 
 use atomic_immut::AtomicImmut;
-use clap::Arg;
-use config::Config;
+use clap::{Arg, SubCommand};
+use config::*;
 use mizumochi::Mizumochi;
 use slog::{Drain, Level};
 use std::sync::Arc;
@@ -41,22 +42,6 @@ fn main() -> Result<(), Box<std::error::Error>> {
                 .value_name("BytePerSecond")
                 .help("Sets byte per second to limit file operations")
                 .long_help("you can put suffixes (KBps, MBps, GBps) at the tail (examples: 1024Bps, 4096KBps, 5Mbps)\nthe default is Bps")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("DURATION")
-                .short("d")
-                .long("duration")
-                .value_name("Duration")
-                .help("Sets period during the operations are unstable")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("FREQUENCY")
-                .short("f")
-                .long("frequency")
-                .value_name("Frequency")
-                .help("Sets frequency of making operations unstable")
                 .takes_value(true),
         )
         .arg(
@@ -79,6 +64,27 @@ fn main() -> Result<(), Box<std::error::Error>> {
                 .required(true)
                 .index(2),
         )
+         .subcommand(
+             SubCommand::with_name("periodic")
+                 .about("Stable/unstable mode toggles periodically under this condition")
+                 .arg(
+                     Arg::with_name("DURATION")
+                         .short("d")
+                         .long("duration")
+                         .takes_value(true)
+                         .default_value("30m")
+                         .required(true)
+                         .help("Sets period during the operations are unstable"),
+                 )
+                 .arg(
+                     Arg::with_name("FREQUENCY")
+                         .short("f")
+                         .long("frequency")
+                         .takes_value(true)
+                         .default_value("60m")
+                         .required(true)
+                         .help("Sets frequency of making operations unstable"),
+                 ))
         .get_matches();
 
     let original_dir = matches.value_of("ORIGINAL_DIR").unwrap();
@@ -92,14 +98,32 @@ fn main() -> Result<(), Box<std::error::Error>> {
         config.speed = speed.parse()?;
     }
 
-    if let Some(duration) = matches.value_of("DURATION") {
-        let secs = parse_time(String::from(duration))?;
-        config.duration = Duration::from_secs(secs);
-    }
+    if let Some(matches) = matches.subcommand_matches("periodic") {
+        let mut p = config::Condition::default_periodic();
 
-    if let Some(frequency) = matches.value_of("FREQUENCY") {
-        let secs = parse_time(String::from(frequency))?;
-        config.frequency = Duration::from_secs(secs);
+        if let Some(duration) = matches.value_of("DURATION") {
+            let secs = parse_time(String::from(duration))?;
+
+            if let Condition::Periodic {
+                ref mut duration, ..
+            } = p
+            {
+                *duration = Duration::from_secs(secs);
+            }
+        }
+
+        if let Some(frequency) = matches.value_of("FREQUENCY") {
+            let secs = parse_time(String::from(frequency))?;
+
+            if let Condition::Periodic {
+                ref mut frequency, ..
+            } = p
+            {
+                *frequency = Duration::from_secs(secs);
+            }
+        }
+
+        config.condition = p;
     }
 
     let decorator = slog_term::TermDecorator::new().build();

@@ -1,14 +1,5 @@
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub duration: Duration,
-    pub frequency: Duration,
-    pub operations: Vec<Operation>,
-    pub speed: Speed,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Speed {
@@ -62,58 +53,12 @@ impl fmt::Display for Speed {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Operation {
-    Read,
-    Write,
-}
-
-impl fmt::Display for Operation {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Operation::Read => write!(f, "Read"),
-            Operation::Write => write!(f, "Write"),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            duration: Duration::from_secs(10 * 60),
-            frequency: Duration::from_secs(30 * 60),
-            operations: vec![Operation::Read, Operation::Write],
-            speed: Speed::PassThrough,
-        }
-    }
-}
-
-impl fmt::Display for Config {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        let d = self.duration.as_secs();
-        let f = self.frequency.as_secs();
-        let ops = self
-            .operations
-            .iter()
-            .fold(Vec::new(), |mut acc, x| {
-                acc.push(format!("{}", x).to_string());
-                acc
-            })
-            .join(":");
-        write!(
-            fmt,
-            "Config {{Duration: {}sec, Frequency: {}sec, Operations: {}, Speed: {}}}",
-            d, f, ops, self.speed
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_speed_from_str() {
+    fn test_speed_new() {
         assert!(Speed::from_str("").is_err());
         assert!(Speed::from_str("alskjaslkdfjhasjdhfb").is_err());
         assert!(Speed::from_str("Bps").is_err());
