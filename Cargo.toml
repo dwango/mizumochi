@@ -3,6 +3,14 @@ name = "mizumochi"
 version = "0.1.0"
 authors = ["mopp <yuta_kobiyama@dwango.co.jp>"]
 license = "MIT OR Apache-2.0"
+description = """
+mizumochi is a tool to simulate unstable disk I/O for testing stability/robustness of system.
+The word unstable here means read/write speed is slowdown.
+"""
+homepage = "https://github.com/dwango/mizumochi"
+repository = "https://github.com/dwango/mizumochi"
+readme = "README.md"
+categories = ["command-line-utilities"]
 
 [dependencies]
 atomic_immut = "0.1"
