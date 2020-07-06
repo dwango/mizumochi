@@ -17,7 +17,7 @@ atomic_immut = "0.1"
 bytecodec = {version = "0.4", features = ["json_codec"]}
 clap = "2"
 fibers = "0.1"
-fibers_http_server = "0.1"
+fibers_http_server = "0.2"
 futures = "0.1"
 fuse = "0.3"
 httpcodec = "0.2"

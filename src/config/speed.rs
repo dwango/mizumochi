@@ -11,8 +11,6 @@ impl FromStr for Speed {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        use std::error::Error;
-
         if s == "pass_through" {
             Ok(Speed::PassThrough)
         } else if s.ends_with("Bps") {
@@ -29,12 +27,12 @@ impl FromStr for Speed {
                 }
             };
 
-            let speed = s.parse::<usize>().map_err(|e| e.description().to_string())?;
+            let speed = s.parse::<usize>().map_err(|e| e.to_string())?;
             let speed = speed.checked_mul(scale).ok_or("overflow")?;
 
             Ok(Speed::Bps(speed))
         } else {
-            let speed = s.parse::<usize>().map_err(|e| e.description().to_string())?;
+            let speed = s.parse::<usize>().map_err(|e| e.to_string())?;
 
             Ok(Speed::Bps(speed))
         }

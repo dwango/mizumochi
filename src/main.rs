@@ -33,7 +33,7 @@ use slog::{Drain, Level};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn main() -> Result<(), Box<std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = app_from_crate!()
         .arg(
             Arg::with_name("SPEED")
@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<std::error::Error>> {
     }
 }
 
-fn parse_time(mut input: String) -> Result<u64, Box<std::error::Error>> {
+fn parse_time(mut input: String) -> Result<u64, Box<dyn std::error::Error>> {
     let suffix = input.pop().ok_or(std::fmt::Error)?;
     let t: u64 = input.parse()?;
 

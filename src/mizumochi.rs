@@ -9,7 +9,6 @@ use slog::Logger;
 use state::{State, StateManager};
 use std;
 use std::collections::HashMap;
-use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -372,7 +371,7 @@ impl Filesystem for Mizumochi {
         info!(self.logger, "init");
 
         Mizumochi::init(self).map_err(|error| {
-            error!(self.logger, "init error: {}", error.description());
+            error!(self.logger, "init error: {}", error);
             libc::EIO
         })
     }
@@ -386,7 +385,7 @@ impl Filesystem for Mizumochi {
             Err(error) => match error.kind() {
                 io::ErrorKind::NotFound => reply.error(libc::ENOENT),
                 _ => {
-                    error!(self.logger, "lookup error: {}", error.description());
+                    error!(self.logger, "lookup error: {}", error);
                     reply.error(libc::EIO)
                 }
             },
@@ -443,7 +442,7 @@ impl Filesystem for Mizumochi {
             let e = match error.kind() {
                 ErrorKind::NotFound => libc::ENOENT,
                 _ => {
-                    error!(self.logger, "readdir error: {}", error.description());
+                    error!(self.logger, "readdir error: {}", error);
                     libc::EIO
                 }
             };
@@ -873,7 +872,7 @@ impl Filesystem for Mizumochi {
         match Mizumochi::create(self, req, parent, name, mode, flags) {
             Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, 0),
             Err(error) => {
-                error!(self.logger, "init error: {}", error.description());
+                error!(self.logger, "init error: {}", error);
                 reply.error(libc::EIO)
             }
         }
