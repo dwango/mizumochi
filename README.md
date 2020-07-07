@@ -37,7 +37,8 @@ cargo install mizumochi
 ## Examples
 ```console
 # Emulate files in `real_dir` at `emulated_dir` and the read/write speed is slowdown every 30 minutes for 10 minutes.
-mizumochi /tmp/emulated_dir/ /tmp/real_dir/ --speed 1024KBps periodic --duration 10m --frequency 30m
+# Slowdown happens in `emulated_dir`.
+mizumochi /tmp/real_dir/ /tmp/emulated_dir/ --speed 1024KBps periodic --duration 10m --frequency 30m
 ```
 
 
