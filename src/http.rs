@@ -18,7 +18,7 @@ pub fn start_server(
     logger: Logger,
     port: u16,
     config: Arc<AtomicImmut<Config>>,
-) -> Result<(), Box<std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let executor = InPlaceExecutor::new()?;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let mut builder = ServerBuilder::new(addr);
