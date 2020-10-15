@@ -1,4 +1,4 @@
-use state::State;
+use crate::state::State;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

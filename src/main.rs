@@ -25,10 +25,10 @@ mod metrics;
 mod mizumochi;
 mod state;
 
+use crate::config::*;
+use crate::mizumochi::Mizumochi;
 use atomic_immut::AtomicImmut;
 use clap::{Arg, SubCommand};
-use config::*;
-use mizumochi::Mizumochi;
 use slog::{Drain, Level};
 use std::sync::Arc;
 use std::time::Duration;
