@@ -1,4 +1,4 @@
-use config::{Condition, Operation};
+use crate::config::{Condition, Operation};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +48,7 @@ impl StateManager {
             self.change_condition(cond);
         }
 
-        use Condition::*;
+        use crate::Condition::*;
         match self.condition {
             Periodic {
                 ref duration,
@@ -109,8 +109,8 @@ fn toggle_mode_if_necessary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use atomic_immut::AtomicImmut;
-    use config::Config;
     use std::sync::Arc;
 
     struct TestFileSystem {

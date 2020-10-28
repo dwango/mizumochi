@@ -1,16 +1,14 @@
+use crate::config::Config;
 use atomic_immut::AtomicImmut;
 use bytecodec::json_codec::{JsonDecoder, JsonEncoder};
 use bytecodec::null::{NullDecoder, NullEncoder};
-use config::Config;
 use fibers::{Executor, InPlaceExecutor, Spawn};
 use fibers_http_server::metrics::MetricsHandler;
 use fibers_http_server::{HandleRequest, Reply, Req, Res, ServerBuilder, Status};
 use futures::future::ok;
 use futures::Future;
 use httpcodec::{BodyDecoder, BodyEncoder};
-use prometrics;
 use slog::Logger;
-use std;
 use std::net::SocketAddr;
 use std::sync::Arc;
 

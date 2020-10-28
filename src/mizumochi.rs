@@ -1,13 +1,11 @@
 // FIXME: Refactor error
+use crate::config::{Config, Operation, Speed};
+use crate::localfile::{Inode, LocalFile};
+use crate::metrics::Metrics;
+use crate::state::{State, StateManager};
 use atomic_immut::AtomicImmut;
-use config::{Config, Operation, Speed};
 use fuse::{self, *};
-use libc;
-use localfile::{Inode, LocalFile};
-use metrics::Metrics;
 use slog::Logger;
-use state::{State, StateManager};
-use std;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -52,7 +50,7 @@ impl Mizumochi {
         mountpoint: PathBuf,
         config: Arc<AtomicImmut<Config>>,
     ) -> Mizumochi {
-        let cond = (&*config.load()).condition.clone();
+        let cond = config.load().condition.clone();
         let state_manager = StateManager::new(cond);
 
         Mizumochi {
@@ -132,13 +130,13 @@ impl Mizumochi {
 
             let filename = path
                 .file_name()
-                .ok_or(io::Error::new(io::ErrorKind::Other, "Cannot get filename"))?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot get filename"))?;
 
             let file = if path.is_dir() {
                 // The files in the directory is loaded later (see lookup).
-                LocalFile::Directory(path.clone().into(), None)
+                LocalFile::Directory(path.clone(), None)
             } else {
-                LocalFile::RegularFile(path.clone().into())
+                LocalFile::RegularFile(path.clone())
             };
 
             let ino = self.ino_count;
@@ -189,7 +187,7 @@ impl Mizumochi {
         let (inode, path) = match self
             .file_map
             .get(&parent)
-            .ok_or(io::Error::new(io::ErrorKind::NotFound, ""))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, ""))?
         {
             LocalFile::Directory(_, None) => {
                 Err(io::Error::new(io::ErrorKind::Other, "not fetched"))
@@ -200,7 +198,7 @@ impl Mizumochi {
                     .iter()
                     .find(|(_, path)| Some(name) == path.file_name());
 
-                let (inode, _) = f.ok_or(io::Error::new(io::ErrorKind::NotFound, ""))?;
+                let (inode, _) = f.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, ""))?;
 
                 let mut path = path.clone();
                 path.push(name);
@@ -257,19 +255,19 @@ impl Mizumochi {
             return Err(libc::EIO);
         }
 
-        let written_size = f.write(buffer).or_else(|error| {
+        let written_size = f.write(buffer).map_err(|error| {
             error!(logger, "write error {}", error);
-            Err(libc::EIO)
+            libc::EIO
         })?;
 
         // Reflect the written result to the actual file.
-        let _ = f.sync_all().or_else(|error| {
+        let _ = f.sync_all().map_err(|error| {
             error!(logger, "write error {}", error);
-            Err(libc::EIO)
+            libc::EIO
         })?;
-        let _ = f.sync_data().or_else(|error| {
+        let _ = f.sync_data().map_err(|error| {
             error!(logger, "write error {}", error);
-            Err(libc::EIO)
+            libc::EIO
         })?;
 
         Ok(written_size)
@@ -315,7 +313,7 @@ impl Mizumochi {
 
             let filename = path
                 .file_name()
-                .ok_or(io::Error::new(io::ErrorKind::Other, "Cannot get filename"))?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot get filename"))?;
             reply.add(*fino, offset, ftype, filename);
 
             offset += 1;
@@ -334,7 +332,7 @@ impl Mizumochi {
     ) -> Result<(FileAttr, FileHandler), io::Error> {
         let name = name
             .to_str()
-            .ok_or(io::Error::new(io::ErrorKind::Other, ""))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, ""))?;
 
         let (attr, fh, ino, f) = {
             let (mut path, files) = match self.file_map.get_mut(&parent) {
@@ -357,7 +355,7 @@ impl Mizumochi {
             self.fh_map.insert(fh, file);
             files.push((ino, name.into()));
 
-            (attr, fh, ino, LocalFile::RegularFile(path.clone()))
+            (attr, fh, ino, LocalFile::RegularFile(path))
         };
 
         self.file_map.insert(ino, f);
